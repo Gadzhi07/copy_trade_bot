@@ -1,14 +1,21 @@
-import asyncio
 import datetime
 import re
-import time
 
-import requests
+import os
+import sys
+
+import asyncio
+import aiohttp
 from binance.client import AsyncClient
 import binance
 
-from main import send_m
 from sql import *
+from main import send_m
+
+from loguru import logger
+
+
+logger.add("logs/log_{time}.log", rotation="55 MB", format="{time} | {level}: {message}")
 
 
 # ------------------ Нужно переписать на async ------------------
@@ -16,10 +23,6 @@ def num_decimal_places(value):
     # находит количество знаков после запятой
     m = re.match(r"^[0-9]*\.([1-9]([0-9]*[1-9])?)0*$", value)
     return len(m.group(1)) if m is not None else 0
-
-
-def send_mess(user, order, count, context):
-    asyncio.get_event_loop().run_until_complete(send_m(user, order, count, context))
 
 
 async def get_open_pos(symbol: str, pos_side: str, client=None, api_key: str = None, secret_key: str = None):
@@ -30,9 +33,15 @@ async def get_open_pos(symbol: str, pos_side: str, client=None, api_key: str = N
         for position in positions:
             if position['positionSide'] == pos_side:
                 return position
-        await client.close_connection()
-    except binance.client.BinanceAPIException:
-        return "Неправильно введён публичный API ключ или секретный API ключ"
+    except binance.client.BinanceAPIException as e:
+        if e.code == -2015:
+            return "Неправильно введён публичный API ключ или секретный API ключ"
+        else:
+            if api_key is not None:
+                logger.error(str(e) + " | " + str(api_key))
+            if client is not None:
+                logger.error(str(e) + " | " + str(tuple(client)))
+            return "Неизвестная ошибка\n" + str(e.message)
 
 
 def select_pos(order, user, trader):
@@ -47,49 +56,36 @@ def select_pos(order, user, trader):
 
 def insert_pos(order, user, trader):
     # открывает позицию
-    # print('\ninsert_pos\n', order, user, trader, '\ninsert_pos')
     pos = select_pos(order, user, trader)
-    # user_in_base = select('users', 'user_id', user)
-    # open_pos = await get_open_pos(user_in_base[5], user_in_base[6], order['symbol'], order['positionSide'])
-    if order['reduceOnly'] is False:
-        if pos is None:
-            if order['positionSide'] != 'BOTH':
-                data = [(order['symbol'], order['positionSide'], str(user), str(trader))]
-            elif order['positionSide'] == 'BOTH':
-                data = [(order['symbol'], order['positionSide'], str(user), str(trader))]
+    if pos is None:
+        data = [(order['symbol'], order['positionSide'], str(user), str(trader))]
+        try:
             insert('positions', data)
-            print('insert positions')
-    if order['reduceOnly'] is True:
-        if pos is None:
-            if order['positionSide'] != 'BOTH':
-                data = [(order['symbol'], order['positionSide'], str(user), str(trader))]
-            elif order['positionSide'] == 'BOTH':
-                data = [(order['symbol'], order['positionSide'], str(user), str(trader))]
-            insert('positions', data)
-            print('insert positions')
+            logger.info(str(user) + ' | insert positions')
+        except Exception as e:
+            logger.error(str(user) + " | " + str(e) + " | insert_pos")
 
 
 def del_pos(user, symbol, position_side):
     # удаляет позицию
-    # print('\ndel_pos\n', user, '\ndel_pos')
-    if position_side != 'BOTH':
+    try:
         delete_3('positions', 'symbol', symbol, 'position_side', position_side,
                  'user_id', str(user))
-    elif position_side == 'BOTH':
-        delete_3('positions', 'symbol', symbol, 'position_side', position_side,
-                 'user_id', str(user))
-    print('delete')
+        logger.info(str(user) + ' | delete')
+    except Exception as e:
+        logger.error(str(user) + " | " + str(e) + " | del_pos")
 
 
 # ------------------ Отмена ордеров ------------------
 async def cancel_orders(trader, id_options, trader_id):
-    orders = await trader.futures_get_all_orders(limit=10)
+    orders = await trader.futures_get_all_orders(limit=11)
     await trader.close_connection()
     orders = orders[::-1]
     users = find('users')
     # для каждого пользователя , у которого включён бот отменять ордера
     for user in users:
         if user[10] == "on" and str(user[1]) in id_options and str(user[4]) == '1':
+            client = None
             try:
                 client = await AsyncClient.create(user[5], user[6])
                 open_ords = await client.futures_get_open_orders()
@@ -115,11 +111,14 @@ async def cancel_orders(trader, id_options, trader_id):
                                     if order['symbol'] == open_ord['symbol'] and (
                                             order['status'] == "CANCELED" or order['status'] == "EXPIRED") and \
                                             float(order[context]) == float(open_ord[context]):
-                                        # print(user[5], user[6])
-                                        print('close')
-                                        await send_m(user[0], order, open_ord['origQty'], "CANCEL")
-                                        await client.futures_cancel_order(symbol=order['symbol'],
-                                                                          orderId=open_ord['orderId'])
+                                        logger.info(str(user[5]) + ' | ' + str(user[6]))
+                                        logger.info('close')
+                                        try:
+                                            await send_m(user[0], order, open_ord['origQty'], "CANCEL")
+                                            await client.futures_cancel_order(symbol=order['symbol'],
+                                                                              orderId=open_ord['orderId'])
+                                        except binance.client.BinanceAPIException as e:
+                                            logger.error(e)
 
                 all_pos_and_ords = []
                 if open_ords is not None and open_ords != []:
@@ -139,19 +138,19 @@ async def cancel_orders(trader, id_options, trader_id):
                     for position_in_base in positions_in_base:
                         if position_in_base is not None and \
                                 [position_in_base[0], position_in_base[1]] not in all_pos_and_ords:
-                            print(positions_in_base)
-                            print(all_pos_and_ords)
+                            logger.info(positions_in_base)
+                            logger.info(all_pos_and_ords)
                             del_pos(user[0], position_in_base[0], position_in_base[1])
 
                 await client.close_connection()
             except Exception as e:
-                print(e)
+                if client is not None:
+                    await client.close_connection()
+                logger.error(str(user[0]) + str(e) + " | " + str(trader))
 
 
 # ------------------ Открытие ордеров ------------------
 async def test_ord1():
-    traders = find('traders')
-    print(traders)
     while True:
         # берём всех трейдеров
         traders = find('traders')
@@ -165,11 +164,9 @@ async def test_ord1():
             trader = await AsyncClient.create(info_trader[2], info_trader[3])
             pos_mode = await trader.futures_get_position_mode()
             pos_mode = pos_mode['dualSidePosition']
-            info = await trader.futures_get_all_orders(limit=4)
-            s = time.time()
+            info = await trader.futures_get_all_orders(limit=6)
             await cancel_orders(trader, id_options, info_trader[0])
-            print(time.time() - s)
-            # await trader.close_connection()
+            await trader.close_connection()
             for order in info:
                 now = datetime.datetime.now()
                 delta = now - datetime.timedelta(minutes=2)
@@ -191,23 +188,19 @@ async def test_ord1():
                         insert("orders", data)
                         order_info = await get_open_pos(symbol=order['symbol'], pos_side=order['positionSide'],
                                                         api_key=info_trader[2], secret_key=info_trader[3])
-                        st = time.time()
                         # открытие ордеров
                         await create_orders(order, order_info, pos_mode, id_options, info_trader[0])
-                        print(time.time() - st, 'all_time')
 
 
 async def create_orders(order, order_info, pos_mode, id_options, trader_id):
-    print('create_orders')
     # проходим по пользователям и вызываем функцию для открытия ордеров
     users = find('users')
     for user in users:
         if user[10] == "on" and str(user[1]) in id_options and str(user[4]) == '1':
             try:
-                client = await AsyncClient.create(user[5], user[6])
-                print(order['side'])
-                # есди ордер не отменён и не истёк
+                # если ордер не отменён и не истёк
                 if order['status'] != "CANCELED" and order['status'] != 'EXPIRED':
+                    client = await AsyncClient.create(user[5], user[6])
                     bal = await client.futures_account()
                     bal = float(bal['availableBalance'])
                     qty_pos = float(float(bal) * (float(user[11]) * 0.01))
@@ -221,27 +214,29 @@ async def create_orders(order, order_info, pos_mode, id_options, trader_id):
                         var = "price"
                     else:
                         var = 'stopPrice'
-                    await new_ord(client, user[0], order, order_info, qty_pos, qty_usdt, pos_mode, trader_id, var)
+                    try:
+                        await new_ord(client, user[0], order, order_info, qty_pos, qty_usdt, pos_mode, trader_id, var)
+                    except binance.client.BinanceAPIException as e:
+                        logger.error(str(e))
             except Exception as e:
-                print(e)
+                logger.error(e)
 
 
 async def new_ord(client, user, order, trader_info, qty, qty_usdt, pos_mode, trader_id, context):
-    print('new_ord')
-    start = time.time()
     # меняем мод на хедж или односторонний
     try:
         await client.futures_change_position_mode(dualSidePosition=pos_mode)
-    except binance.client.BinanceAPIException:
-        pass
+    except binance.client.BinanceAPIException as e:
+        if e.code == -4059:
+            pass
+        else:
+            logger.error(str(e.code) + " : " + str(e.message))
     client_info = await get_open_pos(symbol=order['symbol'], pos_side=order['positionSide'], client=client)
     pos = select_pos(order, user, trader_id)
-    # print(pos)
-    # Проходим по списку всех позиций
-    # print(f"\nSTART_{client_info['positionSide']}\n", client_info, "\n\n", trader_info, "\n\n", order,
-    #       f"\nEND_{client_info['positionSide']}\n")
-    # print(context)
-    # print(order[context])
+    logger.info(client_info)
+    logger.info(trader_info)
+    logger.info(order)
+    logger.info(pos)
     if float(client_info['positionAmt']) > 0.0 and not pos:
         pass
     elif (pos is not None and str(pos[3]) == str(trader_id)) or pos is None:
@@ -249,37 +244,35 @@ async def new_ord(client, user, order, trader_info, qty, qty_usdt, pos_mode, tra
         margin_type = trader_info["marginType"]
         # если у трейдера размер позиции больше 0
         if client_info['positionSide'] == order['positionSide'] and abs(float(trader_info['positionAmt'])) > 0.0:
-            print(1)
             # --------- Зайти в позицию ---------
             # if float(client_info['positionAmt']) == 0.0 and (pos is None or (order['status'] == 'FILLED'
             #                                                                  and abs(
             #             float(trader_info['positionAmt'])) == abs(float(order['origQty'])))):
             if float(client_info['positionAmt']) == 0.0 and pos is None:
                 # Если у трейдер есть открытая позиция, то сюда не попадает
-                if (order['type'] != 'MARKET' and order['status'] != 'FILLED' and
+                if (order['status'] != 'FILLED' and order['type'] != 'MARKET' and
                     abs(float(trader_info['positionAmt'])) == 0.0) or \
-                        (order['type'] == 'MARKET' and
+                        ((order['status'] == 'FILLED' or order['type'] == 'MARKET') and
                          abs(float(trader_info['positionAmt'])) - abs(float(order['origQty'])) == 0):
-                    print(2)
                     count = round((qty / float(order[context])) * shoulder,
                                   num_decimal_places(str(order['origQty'])))
-                    print(count)
-                    await send_m(user, order, count, "NEW")
-                    insert_pos(order, user, trader_id)
+                    send_m_text = "NEW"
+                    try:
+                        await new_orders(client, order, margin_type, shoulder, count, pos_mode)
+                        insert_pos(order, user, trader_id)
+                        await send_m(user, order, count, send_m_text)
+                    except binance.client.BinanceAPIException:
+                        pass
             # --------- Усреднить или Закрыть ---------
             else:
-                print(3)
                 find_percent = 0
                 # --------- Усреднить ЛОНГ/ШОРТ ---------
                 if (client_info['positionSide'] == order['positionSide'] == "LONG" and order['side'] == "BUY") or \
                         (client_info['positionSide'] == order['positionSide'] == "SHORT" and
                          order['side'] == "SELL") or (client_info['positionSide'] == order['positionSide'] == 'BOTH'
                                                       and order['side'] == pos[1]):
-                    print(4)
                     count = float(float(abs(float(client_info['positionAmt']))) * (float(qty_usdt) * 0.01))
-                    print(count)
                     count = round(count, num_decimal_places(str(client_info['positionAmt'])))
-                    print(count, 'count')
                     # if float(count) * float(order[context]) <= 5 and not (order['status'] == 'FILLED'
                     #                                                       and abs(
                     #             float(trader_info['positionAmt'])) == abs(float(order['origQty']))):
@@ -291,7 +284,6 @@ async def new_ord(client, user, order, trader_info, qty, qty_usdt, pos_mode, tra
                         client_info['positionSide'] == order['positionSide'] == "SHORT" and order['side'] == "BUY") \
                         or (
                         client_info['positionSide'] == order['positionSide'] == 'BOTH' and order['side'] != pos[1]):
-                    print(5)
                     if order['type'] != 'MARKET' and abs(float(order['origQty'])) == \
                             abs(float(trader_info['positionAmt'])) and order['status'] != 'FILLED':
                         find_percent = 100.0
@@ -312,41 +304,43 @@ async def new_ord(client, user, order, trader_info, qty, qty_usdt, pos_mode, tra
                         count = -1 * count // round_number_ * -round_number_
                     if order['closePosition'] is True:
                         count = abs(float(client_info['positionAmt']))
-                    print(count)
-                    print(find_percent)
-                    await send_m(user, order, count, f"CLOSE {order['positionSide']}")
+                    send_m_text = f"CLOSE {order['positionSide']}"
                 if find_percent != 100.0 and order['reduceOnly'] is False:
                     nulls_ = '{:0' + str(num_decimal_places(str(count))) + '}'
                     round_number_ = float(nulls_.format(1)[0] + '.' + nulls_.format(1)[1:])
                     count = -1 * count // round_number_ * -round_number_
-                    print(count)
-                    await send_m(user, order, count, f"AVERAGE {order['positionSide']}")
+                    send_m_text = f"AVERAGE {order['positionSide']}"
                 elif find_percent != 100.0 and order['reduceOnly'] is True:
                     count = round(count, num_decimal_places(str(client_info['positionAmt'])))
-            print(count, 'count_count')
-            await new_orders(client, order, margin_type, shoulder, count, context, pos_mode)
+                try:
+                    await new_orders(client, order, margin_type, shoulder, count, pos_mode)
+                    await send_m(user, order, count, send_m_text)
+                except binance.client.BinanceAPIException:
+                    pass
+
         # если новый ордер (позиция трейдера равна нулю)
         elif client_info['positionSide'] == order['positionSide'] and order['status'] == 'NEW' and abs(
                 float(client_info['positionAmt'])) == 0.0:
-            print(333)
-            print(order[context])
             count = round((qty / float(order[context])) * shoulder, num_decimal_places(str(order['origQty'])))
-            print(count)
-            await send_m(user, order, count, f" {order['positionSide']}")
-            insert_pos(order, user, trader_id)
-            await new_orders(client, order, margin_type, shoulder, count, context, pos_mode)
+            try:
+                await new_orders(client, order, margin_type, shoulder, count, pos_mode)
+                await send_m(user, order, count, f" {order['positionSide']}")
+                insert_pos(order, user, trader_id)
+            except binance.client.BinanceAPIException:
+                pass
         # если полностью закрывается ордер
         elif client_info['positionSide'] == order['positionSide']:
-            print(9)
             count = abs(float(client_info['positionAmt']))
-            await new_orders(client, order, margin_type, shoulder, count, context, pos_mode)
-            await send_m(user, order, count, f"CLOSE {client_info['positionSide']}")
-    print(time.time() - start, 'new_ord')
+            try:
+                await new_orders(client, order, margin_type, shoulder, count, pos_mode)
+                await send_m(user, order, count, f"CLOSE {client_info['positionSide']}")
+            except binance.client.BinanceAPIException:
+                pass
+        logger.info(str(count) + " | " + str(user) + " | new_ord")
+        # await client.close_connection()
 
 
-async def new_orders(client, order, margin_type, shoulder, count, context, pos_mode):
-    print('new_orders')
-    start = time.time()
+async def new_orders(client, order, margin_type, shoulder, count, pos_mode):
     # процесс открытия / закрытия ордеров и позиций
     if margin_type == "cross":
         margin_type = "CROSSED"
@@ -355,27 +349,28 @@ async def new_orders(client, order, margin_type, shoulder, count, context, pos_m
     try:
         await client.futures_change_leverage(symbol=order['symbol'], leverage=int(shoulder))
         await client.futures_change_margin_type(symbol=order['symbol'], marginType=margin_type)
-    except binance.client.BinanceAPIException:
-        try:
+    except binance.client.BinanceAPIException as e:
+        if e.code == -4028:
             await client.futures_change_margin_type(symbol=order['symbol'], marginType=margin_type)
-        except binance.client.BinanceAPIException:
-            pass
+        elif e.code != -4046:
+            logger.error(str(count) + str(client) + str(order))
     params = {'symbol': order['symbol'], 'type': order['type'], 'positionSide': order['positionSide'],
               'side': order['side'], 'quantity': abs(count)}
     if order['type'] == "LIMIT":
-        params['price'] = float(order[context])
+        params['price'] = float(order['price'])
         params['timeInForce'] = order['timeInForce']
     if order['type'] == "MARKET":
         pass
     if order['type'] == 'STOP' or order['type'] == "TAKE_PROFIT":
-        params['price'] = float(order[context])
+        params['price'] = float(order['price'])
         params['stopPrice'] = float(order['stopPrice'])
         params['priceProtect'] = order['priceProtect']
     if order['type'] == "STOP_MARKET" or order['type'] == "TAKE_PROFIT_MARKET":
         params['stopPrice'] = float(order['stopPrice'])
         params['closePosition'] = order['closePosition']
         params['priceProtect'] = order['priceProtect']
-        params.pop('quantity')
+        if params['closePosition'] is True:
+            params.pop('quantity')
     elif order['type'] == 'TRAILING_STOP_MARKET':
         params['callbackRate'] = float(order['priceRate'])
         params['workingType'] = order['workingType']
@@ -383,21 +378,28 @@ async def new_orders(client, order, margin_type, shoulder, count, context, pos_m
 
     if pos_mode is False and order['closePosition'] is False:
         params['reduceOnly'] = order['reduceOnly']
-    print(params)
-    try:
-        await client.futures_create_order(**params)
-    except binance.client.BinanceAPIException:
-        params.pop('activationPrice')
-        await client.futures_create_order(**params)
-    print(time.time() - start, 'new_orders')
+    logger.info(params)
+    if params['quantity'] != 0.0:
+        try:
+            await client.futures_create_order(**params)
+        except binance.client.BinanceAPIException as e:
+            if e.code == -2021:
+                params.pop('activationPrice')
+                await client.futures_create_order(**params)
+            else:
+                logger.error(str(e) + " | new_orders")
+    if params['quantity'] == 0.0:
+        logger.debug("count - " + str(params['quantity']) + " | new_orders")
     await client.close_connection()
 
 
 if __name__ == '__main__':
     try:
-        print('---------------Start---------------')
+        logger.info('Start')
         asyncio.get_event_loop().run_until_complete(test_ord1())
+        os.execv(__file__, sys.argv)
     except KeyboardInterrupt:
-        print('----------------End----------------')
-    except requests.exceptions.ConnectionError:
-        print('ConnectionError: Please turn on Wi-Fi')
+        logger.info('End')
+    except aiohttp.ClientConnectorError:
+        logger.debug('ConnectionError: Please turn on Wi-Fi')
+        os.execv(__file__, sys.argv)
